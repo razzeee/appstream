@@ -86,6 +86,51 @@ as_get_resource_safe (void)
 	return resource;
 }
 
+static GHashTable *category_names_cache = NULL;
+static GHashTable *tld_cache = NULL;
+static GHashTable *platform_arch_cache = NULL;
+static GHashTable *platform_os_cache = NULL;
+static GHashTable *platform_env_cache = NULL;
+static GHashTable *reference_registries_cache = NULL;
+
+/**
+ * as_utils_load_list_from_resource:
+ *
+ * Helper to load a newline-separated list from a GResource into a GHashTable
+ * for O(1) lookup.
+ */
+static GHashTable *
+as_utils_load_list_from_resource (const gchar *resource_path)
+{
+	GHashTable *ht;
+	g_autoptr(GBytes) data = NULL;
+	const gchar *data_ptr;
+	g_auto(GStrv) lines = NULL;
+	GResource *resource = as_get_resource_safe ();
+
+	data = g_resource_lookup_data (resource,
+				       resource_path,
+				       G_RESOURCE_LOOKUP_FLAGS_NONE,
+				       NULL);
+	if (data == NULL)
+		return NULL;
+
+	ht = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+	data_ptr = g_bytes_get_data (data, NULL);
+	lines = g_strsplit (data_ptr, "\n", -1);
+	for (guint i = 0; lines[i] != NULL; i++) {
+		gchar *line = lines[i];
+		g_strstrip (line);
+		if (as_is_empty (line) || g_str_has_prefix (line, "#"))
+			continue;
+		g_hash_table_add (ht, g_strdup (line));
+	}
+
+	/* if the list was empty, we still return an empty hash table to avoid
+	 * repeated loading attempts */
+	return ht;
+}
+
 /**
  * as_markup_strsplit_words:
  * @text: the text to split.
@@ -1293,10 +1338,6 @@ as_utils_search_token_valid (const gchar *token)
 gboolean
 as_utils_is_category_name (const gchar *category_name)
 {
-	g_autoptr(GBytes) data = NULL;
-	g_autofree gchar *key = NULL;
-	GResource *resource = as_get_resource_safe ();
-
 	/* custom spec-extensions are generally valid if prefixed correctly */
 	if (g_str_has_prefix (category_name, "X-"))
 		return TRUE;
@@ -1305,15 +1346,15 @@ as_utils_is_category_name (const gchar *category_name)
 	if (g_str_has_prefix (category_name, "#"))
 		return FALSE;
 
-	/* load the readonly data section and look for the category name */
-	data = g_resource_lookup_data (resource,
-				       "/org/freedesktop/appstream/xdg-category-names.txt",
-				       G_RESOURCE_LOOKUP_FLAGS_NONE,
-				       NULL);
-	if (data == NULL)
-		return FALSE;
-	key = g_strdup_printf ("\n%s\n", category_name);
-	return g_strstr_len (g_bytes_get_data (data, NULL), -1, key) != NULL;
+	if (g_once_init_enter (&category_names_cache)) {
+		GHashTable *ht = as_utils_load_list_from_resource (
+		    "/org/freedesktop/appstream/xdg-category-names.txt");
+		if (ht == NULL)
+			ht = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+		g_once_init_leave (&category_names_cache, ht);
+	}
+
+	return g_hash_table_contains (category_names_cache, category_name);
 }
 
 /**
@@ -1380,23 +1421,19 @@ as_utils_category_name_is_bad (const gchar *category_name)
 gboolean
 as_utils_is_tld (const gchar *tld)
 {
-	g_autoptr(GBytes) data = NULL;
-	g_autofree gchar *key = NULL;
-	GResource *resource = as_get_resource_safe ();
-
 	/* safeguard against accidentally matching comments */
 	if (as_is_empty (tld) || g_str_has_prefix (tld, "#"))
 		return FALSE;
 
-	/* load the readonly data section and look for the TLD */
-	data = g_resource_lookup_data (resource,
-				       "/org/freedesktop/appstream/iana-filtered-tld-list.txt",
-				       G_RESOURCE_LOOKUP_FLAGS_NONE,
-				       NULL);
-	if (data == NULL)
-		return FALSE;
-	key = g_strdup_printf ("\n%s\n", tld);
-	return g_strstr_len (g_bytes_get_data (data, NULL), -1, key) != NULL;
+	if (g_once_init_enter (&tld_cache)) {
+		GHashTable *ht = as_utils_load_list_from_resource (
+		    "/org/freedesktop/appstream/iana-filtered-tld-list.txt");
+		if (ht == NULL)
+			ht = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+		g_once_init_leave (&tld_cache, ht);
+	}
+
+	return g_hash_table_contains (tld_cache, tld);
 }
 
 /**
@@ -1516,10 +1553,6 @@ as_utils_get_gui_environment_style_name (const gchar *env_style)
 gboolean
 as_utils_is_platform_triplet_arch (const gchar *arch)
 {
-	g_autoptr(GBytes) data = NULL;
-	g_autofree gchar *key = NULL;
-	GResource *resource = NULL;
-
 	if (as_is_empty (arch))
 		return FALSE;
 
@@ -1531,17 +1564,15 @@ as_utils_is_platform_triplet_arch (const gchar *arch)
 	if (g_str_has_prefix (arch, "#"))
 		return FALSE;
 
-	resource = as_get_resource_safe ();
+	if (g_once_init_enter (&platform_arch_cache)) {
+		GHashTable *ht = as_utils_load_list_from_resource (
+		    "/org/freedesktop/appstream/platform_arch.txt");
+		if (ht == NULL)
+			ht = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+		g_once_init_leave (&platform_arch_cache, ht);
+	}
 
-	/* load the readonly data section */
-	data = g_resource_lookup_data (resource,
-				       "/org/freedesktop/appstream/platform_arch.txt",
-				       G_RESOURCE_LOOKUP_FLAGS_NONE,
-				       NULL);
-	if (data == NULL)
-		return FALSE;
-	key = g_strdup_printf ("\n%s\n", arch);
-	return g_strstr_len (g_bytes_get_data (data, NULL), -1, key) != NULL;
+	return g_hash_table_contains (platform_arch_cache, arch);
 }
 
 /**
@@ -1558,10 +1589,6 @@ as_utils_is_platform_triplet_arch (const gchar *arch)
 gboolean
 as_utils_is_platform_triplet_oskernel (const gchar *os)
 {
-	g_autoptr(GBytes) data = NULL;
-	g_autofree gchar *key = NULL;
-	GResource *resource;
-
 	if (as_is_empty (os))
 		return FALSE;
 
@@ -1573,17 +1600,15 @@ as_utils_is_platform_triplet_oskernel (const gchar *os)
 	if (g_str_has_prefix (os, "#"))
 		return FALSE;
 
-	resource = as_get_resource_safe ();
+	if (g_once_init_enter (&platform_os_cache)) {
+		GHashTable *ht = as_utils_load_list_from_resource (
+		    "/org/freedesktop/appstream/platform_os.txt");
+		if (ht == NULL)
+			ht = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+		g_once_init_leave (&platform_os_cache, ht);
+	}
 
-	/* load the readonly data section */
-	data = g_resource_lookup_data (resource,
-				       "/org/freedesktop/appstream/platform_os.txt",
-				       G_RESOURCE_LOOKUP_FLAGS_NONE,
-				       NULL);
-	if (data == NULL)
-		return FALSE;
-	key = g_strdup_printf ("\n%s\n", os);
-	return g_strstr_len (g_bytes_get_data (data, NULL), -1, key) != NULL;
+	return g_hash_table_contains (platform_os_cache, os);
 }
 
 /**
@@ -1600,10 +1625,6 @@ as_utils_is_platform_triplet_oskernel (const gchar *os)
 gboolean
 as_utils_is_platform_triplet_osenv (const gchar *env)
 {
-	g_autoptr(GBytes) data = NULL;
-	g_autofree gchar *key = NULL;
-	GResource *resource;
-
 	if (as_is_empty (env))
 		return FALSE;
 
@@ -1615,17 +1636,15 @@ as_utils_is_platform_triplet_osenv (const gchar *env)
 	if (g_str_has_prefix (env, "#"))
 		return FALSE;
 
-	resource = as_get_resource_safe ();
+	if (g_once_init_enter (&platform_env_cache)) {
+		GHashTable *ht = as_utils_load_list_from_resource (
+		    "/org/freedesktop/appstream/platform_env.txt");
+		if (ht == NULL)
+			ht = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+		g_once_init_leave (&platform_env_cache, ht);
+	}
 
-	/* load the readonly data section */
-	data = g_resource_lookup_data (resource,
-				       "/org/freedesktop/appstream/platform_env.txt",
-				       G_RESOURCE_LOOKUP_FLAGS_NONE,
-				       NULL);
-	if (data == NULL)
-		return FALSE;
-	key = g_strdup_printf ("\n%s\n", env);
-	return g_strstr_len (g_bytes_get_data (data, NULL), -1, key) != NULL;
+	return g_hash_table_contains (platform_env_cache, env);
 }
 
 /**
@@ -1673,10 +1692,6 @@ as_utils_is_platform_triplet (const gchar *triplet)
 gboolean
 as_utils_is_reference_registry (const gchar *regname)
 {
-	g_autoptr(GBytes) data = NULL;
-	g_autofree gchar *key = NULL;
-	GResource *resource = NULL;
-
 	if (as_is_empty (regname))
 		return FALSE;
 
@@ -1684,17 +1699,15 @@ as_utils_is_reference_registry (const gchar *regname)
 	if (g_str_has_prefix (regname, "#"))
 		return FALSE;
 
-	resource = as_get_resource_safe ();
+	if (g_once_init_enter (&reference_registries_cache)) {
+		GHashTable *ht = as_utils_load_list_from_resource (
+		    "/org/freedesktop/appstream/reference-registries.txt");
+		if (ht == NULL)
+			ht = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+		g_once_init_leave (&reference_registries_cache, ht);
+	}
 
-	/* load the readonly data section */
-	data = g_resource_lookup_data (resource,
-				       "/org/freedesktop/appstream/reference-registries.txt",
-				       G_RESOURCE_LOOKUP_FLAGS_NONE,
-				       NULL);
-	if (data == NULL)
-		return FALSE;
-	key = g_strdup_printf ("\n%s\n", regname);
-	return g_strstr_len (g_bytes_get_data (data, NULL), -1, key) != NULL;
+	return g_hash_table_contains (reference_registries_cache, regname);
 }
 
 /**

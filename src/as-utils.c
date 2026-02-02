@@ -99,13 +99,14 @@ as_populate_hash_table_from_resource (GHashTable *table, const gchar *resource_p
 	gsize data_size;
 	g_auto(GStrv) lines = NULL;
 	GResource *resource = as_get_resource_safe ();
+	g_autofree gchar *data_str = NULL;
 
 	data = g_resource_lookup_data (resource, resource_path, G_RESOURCE_LOOKUP_FLAGS_NONE, NULL);
 	if (data == NULL)
 		return;
 
 	data_ptr = g_bytes_get_data (data, &data_size);
-	g_autofree gchar *data_str = g_strndup (data_ptr, data_size);
+	data_str = g_strndup (data_ptr, data_size);
 	lines = g_strsplit (data_str, "\n", -1);
 	for (guint i = 0; lines[i] != NULL; i++) {
 		gchar *line = lines[i];
@@ -504,15 +505,18 @@ as_utils_delete_dir_recursive (const gchar *dirname)
 		goto out;
 
 	while (TRUE) {
-		g_autoptr(GFileInfo) info = g_file_enumerator_next_file (enr, NULL, &error);
+		g_autoptr(GFileInfo) info = NULL;
+		g_autofree gchar *path = NULL;
+
+		info = g_file_enumerator_next_file (enr, NULL, &error);
 		if (info == NULL)
 			break;
 		if (error != NULL)
 			goto out;
 
-		g_autofree gchar *path = g_build_filename (dirname,
-							   g_file_info_get_name (info),
-							   NULL);
+		path = g_build_filename (dirname,
+					 g_file_info_get_name (info),
+					 NULL);
 		if (g_file_info_get_file_type (info) == G_FILE_TYPE_DIRECTORY)
 			as_utils_delete_dir_recursive (path);
 		else
@@ -543,7 +547,6 @@ as_utils_find_files_matching (const gchar *dir,
 			      GError **error)
 {
 	GPtrArray *list;
-	GFileInfo *file_info;
 	GFileEnumerator *enumerator = NULL;
 	GFile *fdir;
 	GError *tmp_error = NULL;
@@ -563,10 +566,12 @@ as_utils_find_files_matching (const gchar *dir,
 		goto out;
 
 	while (TRUE) {
-		g_autoptr(GFileInfo) file_info = g_file_enumerator_next_file (enumerator,
-										NULL,
-										&tmp_error);
+		g_autoptr(GFileInfo) file_info = NULL;
 		g_autofree gchar *path = NULL;
+
+		file_info = g_file_enumerator_next_file (enumerator,
+							NULL,
+							&tmp_error);
 
 		if (file_info == NULL)
 			break;

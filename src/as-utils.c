@@ -87,6 +87,36 @@ as_get_resource_safe (void)
 }
 
 /**
+ * as_populate_hash_table_from_resource:
+ *
+ * Internal helper to populate a hash table from a resource file.
+ */
+static void
+as_populate_hash_table_from_resource (GHashTable *table, const gchar *resource_path)
+{
+	g_autoptr(GBytes) data = NULL;
+	const gchar *data_ptr;
+	gsize data_size;
+	g_auto(GStrv) lines = NULL;
+	GResource *resource = as_get_resource_safe ();
+
+	data = g_resource_lookup_data (resource, resource_path, G_RESOURCE_LOOKUP_FLAGS_NONE, NULL);
+	if (data == NULL)
+		return;
+
+	data_ptr = g_bytes_get_data (data, &data_size);
+	g_autofree gchar *data_str = g_strndup (data_ptr, data_size);
+	lines = g_strsplit (data_str, "\n", -1);
+	for (guint i = 0; lines[i] != NULL; i++) {
+		gchar *line = lines[i];
+		g_strstrip (line);
+		if (line[0] == '\0' || line[0] == '#')
+			continue;
+		g_hash_table_add (table, g_strdup (line));
+	}
+}
+
+/**
  * as_markup_strsplit_words:
  * @text: the text to split.
  * @line_len: the maximum length of the output line
@@ -455,7 +485,6 @@ as_utils_delete_dir_recursive (const gchar *dirname)
 	gboolean ret = FALSE;
 	GFile *dir;
 	GFileEnumerator *enr;
-	g_autoptr(GFileInfo) info = NULL;
 	g_return_val_if_fail (dirname != NULL, FALSE);
 
 	if (!g_file_test (dirname, G_FILE_TEST_IS_DIR))
@@ -463,7 +492,8 @@ as_utils_delete_dir_recursive (const gchar *dirname)
 
 	dir = g_file_new_for_path (dirname);
 	enr = g_file_enumerate_children (dir,
-					 "standard::name",
+					 G_FILE_ATTRIBUTE_STANDARD_NAME
+					 "," G_FILE_ATTRIBUTE_STANDARD_TYPE,
 					 G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
 					 NULL,
 					 &error);
@@ -472,21 +502,21 @@ as_utils_delete_dir_recursive (const gchar *dirname)
 
 	if (enr == NULL)
 		goto out;
-	info = g_file_enumerator_next_file (enr, NULL, &error);
-	if (error != NULL)
-		goto out;
-	while (info != NULL) {
+
+	while (TRUE) {
+		g_autoptr(GFileInfo) info = g_file_enumerator_next_file (enr, NULL, &error);
+		if (info == NULL)
+			break;
+		if (error != NULL)
+			goto out;
+
 		g_autofree gchar *path = g_build_filename (dirname,
 							   g_file_info_get_name (info),
 							   NULL);
-		if (g_file_test (path, G_FILE_TEST_IS_DIR))
+		if (g_file_info_get_file_type (info) == G_FILE_TYPE_DIRECTORY)
 			as_utils_delete_dir_recursive (path);
 		else
 			g_remove (path);
-		g_object_unref (info);
-		info = g_file_enumerator_next_file (enr, NULL, &error);
-		if (error != NULL)
-			goto out;
 	}
 	if (g_file_test (dirname, G_FILE_TEST_EXISTS))
 		g_rmdir (dirname);
@@ -524,28 +554,32 @@ as_utils_find_files_matching (const gchar *dir,
 	fdir = g_file_new_for_path (dir);
 	enumerator = g_file_enumerate_children (fdir,
 						G_FILE_ATTRIBUTE_STANDARD_NAME
-						"," G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN,
+						"," G_FILE_ATTRIBUTE_STANDARD_IS_HIDDEN
+						"," G_FILE_ATTRIBUTE_STANDARD_TYPE,
 						0,
 						NULL,
 						&tmp_error);
 	if (tmp_error != NULL)
 		goto out;
 
-	while ((file_info = g_file_enumerator_next_file (enumerator, NULL, &tmp_error)) != NULL) {
+	while (TRUE) {
+		g_autoptr(GFileInfo) file_info = g_file_enumerator_next_file (enumerator,
+										NULL,
+										&tmp_error);
 		g_autofree gchar *path = NULL;
 
-		if (tmp_error != NULL) {
-			g_object_unref (file_info);
+		if (file_info == NULL)
 			break;
-		}
-		if (g_file_info_get_is_hidden (file_info)) {
-			g_object_unref (file_info);
+
+		if (tmp_error != NULL)
+			break;
+
+		if (g_file_info_get_is_hidden (file_info))
 			continue;
-		}
 
 		path = g_build_filename (dir, g_file_info_get_name (file_info), NULL);
 
-		if ((!g_file_test (path, G_FILE_TEST_IS_REGULAR)) && (recursive)) {
+		if (g_file_info_get_file_type (file_info) == G_FILE_TYPE_DIRECTORY && recursive) {
 			GPtrArray *subdir_list;
 			guint i;
 			subdir_list = as_utils_find_files_matching (path,
@@ -556,7 +590,6 @@ as_utils_find_files_matching (const gchar *dir,
 			if (subdir_list == NULL) {
 				g_ptr_array_unref (list);
 				list = NULL;
-				g_object_unref (file_info);
 				break;
 			}
 			for (i = 0; i < subdir_list->len; i++)
@@ -568,15 +601,11 @@ as_utils_find_files_matching (const gchar *dir,
 			if (!as_is_empty (pattern)) {
 				if (!g_pattern_match_simple (pattern,
 							     g_file_info_get_name (file_info))) {
-					g_object_unref (file_info);
 					continue;
 				}
 			}
-			g_ptr_array_add (list, path);
-			path = NULL;
+			g_ptr_array_add (list, g_steal_pointer (&path));
 		}
-
-		g_object_unref (file_info);
 	}
 
 out:
@@ -998,7 +1027,8 @@ gboolean
 as_copy_file (const gchar *source, const gchar *destination, GError **error)
 {
 	FILE *fsrc, *fdest;
-	int a;
+	gchar buffer[4096];
+	size_t n;
 
 	fsrc = fopen (source, "rb");
 	if (fsrc == NULL) {
@@ -1021,13 +1051,28 @@ as_copy_file (const gchar *source, const gchar *destination, GError **error)
 		return FALSE;
 	}
 
-	while (TRUE) {
-		a = fgetc (fsrc);
+	while ((n = fread (buffer, 1, sizeof (buffer), fsrc)) > 0) {
+		if (fwrite (buffer, 1, n, fdest) != n) {
+			g_set_error (error,
+				     G_FILE_ERROR,
+				     G_FILE_ERROR_FAILED,
+				     "Could not copy file: %s",
+				     g_strerror (errno));
+			fclose (fsrc);
+			fclose (fdest);
+			return FALSE;
+		}
+	}
 
-		if (!feof (fsrc))
-			fputc (a, fdest);
-		else
-			break;
+	if (ferror (fsrc)) {
+		g_set_error (error,
+			     G_FILE_ERROR,
+			     G_FILE_ERROR_FAILED,
+			     "Could not copy file: %s",
+			     g_strerror (errno));
+		fclose (fsrc);
+		fclose (fdest);
+		return FALSE;
 	}
 
 	fclose (fdest);
@@ -1293,9 +1338,7 @@ as_utils_search_token_valid (const gchar *token)
 gboolean
 as_utils_is_category_name (const gchar *category_name)
 {
-	g_autoptr(GBytes) data = NULL;
-	g_autofree gchar *key = NULL;
-	GResource *resource = as_get_resource_safe ();
+	static GHashTable *categories = NULL;
 
 	/* custom spec-extensions are generally valid if prefixed correctly */
 	if (g_str_has_prefix (category_name, "X-"))
@@ -1305,15 +1348,15 @@ as_utils_is_category_name (const gchar *category_name)
 	if (g_str_has_prefix (category_name, "#"))
 		return FALSE;
 
-	/* load the readonly data section and look for the category name */
-	data = g_resource_lookup_data (resource,
-				       "/org/freedesktop/appstream/xdg-category-names.txt",
-				       G_RESOURCE_LOOKUP_FLAGS_NONE,
-				       NULL);
-	if (data == NULL)
-		return FALSE;
-	key = g_strdup_printf ("\n%s\n", category_name);
-	return g_strstr_len (g_bytes_get_data (data, NULL), -1, key) != NULL;
+	if (g_once_init_enter (&categories)) {
+		GHashTable *ht = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+		as_populate_hash_table_from_resource (
+		    ht,
+		    "/org/freedesktop/appstream/xdg-category-names.txt");
+		g_once_init_leave (&categories, ht);
+	}
+
+	return g_hash_table_contains (categories, category_name);
 }
 
 /**
@@ -1380,23 +1423,21 @@ as_utils_category_name_is_bad (const gchar *category_name)
 gboolean
 as_utils_is_tld (const gchar *tld)
 {
-	g_autoptr(GBytes) data = NULL;
-	g_autofree gchar *key = NULL;
-	GResource *resource = as_get_resource_safe ();
+	static GHashTable *tlds = NULL;
 
 	/* safeguard against accidentally matching comments */
 	if (as_is_empty (tld) || g_str_has_prefix (tld, "#"))
 		return FALSE;
 
-	/* load the readonly data section and look for the TLD */
-	data = g_resource_lookup_data (resource,
-				       "/org/freedesktop/appstream/iana-filtered-tld-list.txt",
-				       G_RESOURCE_LOOKUP_FLAGS_NONE,
-				       NULL);
-	if (data == NULL)
-		return FALSE;
-	key = g_strdup_printf ("\n%s\n", tld);
-	return g_strstr_len (g_bytes_get_data (data, NULL), -1, key) != NULL;
+	if (g_once_init_enter (&tlds)) {
+		GHashTable *ht = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+		as_populate_hash_table_from_resource (
+		    ht,
+		    "/org/freedesktop/appstream/iana-filtered-tld-list.txt");
+		g_once_init_leave (&tlds, ht);
+	}
+
+	return g_hash_table_contains (tlds, tld);
 }
 
 /**
@@ -1516,9 +1557,7 @@ as_utils_get_gui_environment_style_name (const gchar *env_style)
 gboolean
 as_utils_is_platform_triplet_arch (const gchar *arch)
 {
-	g_autoptr(GBytes) data = NULL;
-	g_autofree gchar *key = NULL;
-	GResource *resource = NULL;
+	static GHashTable *archs = NULL;
 
 	if (as_is_empty (arch))
 		return FALSE;
@@ -1531,17 +1570,14 @@ as_utils_is_platform_triplet_arch (const gchar *arch)
 	if (g_str_has_prefix (arch, "#"))
 		return FALSE;
 
-	resource = as_get_resource_safe ();
+	if (g_once_init_enter (&archs)) {
+		GHashTable *ht = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+		as_populate_hash_table_from_resource (ht,
+						      "/org/freedesktop/appstream/platform_arch.txt");
+		g_once_init_leave (&archs, ht);
+	}
 
-	/* load the readonly data section */
-	data = g_resource_lookup_data (resource,
-				       "/org/freedesktop/appstream/platform_arch.txt",
-				       G_RESOURCE_LOOKUP_FLAGS_NONE,
-				       NULL);
-	if (data == NULL)
-		return FALSE;
-	key = g_strdup_printf ("\n%s\n", arch);
-	return g_strstr_len (g_bytes_get_data (data, NULL), -1, key) != NULL;
+	return g_hash_table_contains (archs, arch);
 }
 
 /**
@@ -1558,9 +1594,7 @@ as_utils_is_platform_triplet_arch (const gchar *arch)
 gboolean
 as_utils_is_platform_triplet_oskernel (const gchar *os)
 {
-	g_autoptr(GBytes) data = NULL;
-	g_autofree gchar *key = NULL;
-	GResource *resource;
+	static GHashTable *osk_list = NULL;
 
 	if (as_is_empty (os))
 		return FALSE;
@@ -1573,17 +1607,14 @@ as_utils_is_platform_triplet_oskernel (const gchar *os)
 	if (g_str_has_prefix (os, "#"))
 		return FALSE;
 
-	resource = as_get_resource_safe ();
+	if (g_once_init_enter (&osk_list)) {
+		GHashTable *ht = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+		as_populate_hash_table_from_resource (ht,
+						      "/org/freedesktop/appstream/platform_os.txt");
+		g_once_init_leave (&osk_list, ht);
+	}
 
-	/* load the readonly data section */
-	data = g_resource_lookup_data (resource,
-				       "/org/freedesktop/appstream/platform_os.txt",
-				       G_RESOURCE_LOOKUP_FLAGS_NONE,
-				       NULL);
-	if (data == NULL)
-		return FALSE;
-	key = g_strdup_printf ("\n%s\n", os);
-	return g_strstr_len (g_bytes_get_data (data, NULL), -1, key) != NULL;
+	return g_hash_table_contains (osk_list, os);
 }
 
 /**
@@ -1600,9 +1631,7 @@ as_utils_is_platform_triplet_oskernel (const gchar *os)
 gboolean
 as_utils_is_platform_triplet_osenv (const gchar *env)
 {
-	g_autoptr(GBytes) data = NULL;
-	g_autofree gchar *key = NULL;
-	GResource *resource;
+	static GHashTable *env_list = NULL;
 
 	if (as_is_empty (env))
 		return FALSE;
@@ -1615,17 +1644,14 @@ as_utils_is_platform_triplet_osenv (const gchar *env)
 	if (g_str_has_prefix (env, "#"))
 		return FALSE;
 
-	resource = as_get_resource_safe ();
+	if (g_once_init_enter (&env_list)) {
+		GHashTable *ht = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+		as_populate_hash_table_from_resource (ht,
+						      "/org/freedesktop/appstream/platform_env.txt");
+		g_once_init_leave (&env_list, ht);
+	}
 
-	/* load the readonly data section */
-	data = g_resource_lookup_data (resource,
-				       "/org/freedesktop/appstream/platform_env.txt",
-				       G_RESOURCE_LOOKUP_FLAGS_NONE,
-				       NULL);
-	if (data == NULL)
-		return FALSE;
-	key = g_strdup_printf ("\n%s\n", env);
-	return g_strstr_len (g_bytes_get_data (data, NULL), -1, key) != NULL;
+	return g_hash_table_contains (env_list, env);
 }
 
 /**
@@ -1673,9 +1699,7 @@ as_utils_is_platform_triplet (const gchar *triplet)
 gboolean
 as_utils_is_reference_registry (const gchar *regname)
 {
-	g_autoptr(GBytes) data = NULL;
-	g_autofree gchar *key = NULL;
-	GResource *resource = NULL;
+	static GHashTable *registries = NULL;
 
 	if (as_is_empty (regname))
 		return FALSE;
@@ -1684,17 +1708,15 @@ as_utils_is_reference_registry (const gchar *regname)
 	if (g_str_has_prefix (regname, "#"))
 		return FALSE;
 
-	resource = as_get_resource_safe ();
+	if (g_once_init_enter (&registries)) {
+		GHashTable *ht = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+		as_populate_hash_table_from_resource (
+		    ht,
+		    "/org/freedesktop/appstream/reference-registries.txt");
+		g_once_init_leave (&registries, ht);
+	}
 
-	/* load the readonly data section */
-	data = g_resource_lookup_data (resource,
-				       "/org/freedesktop/appstream/reference-registries.txt",
-				       G_RESOURCE_LOOKUP_FLAGS_NONE,
-				       NULL);
-	if (data == NULL)
-		return FALSE;
-	key = g_strdup_printf ("\n%s\n", regname);
-	return g_strstr_len (g_bytes_get_data (data, NULL), -1, key) != NULL;
+	return g_hash_table_contains (registries, regname);
 }
 
 /**
